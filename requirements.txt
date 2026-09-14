@@ -1,0 +1,3 @@
+# pdf-interleave_tool_diy 依赖
+# 安装：pip install -r requirements.txt
+pymupdf>=1.23.0
