@@ -336,6 +336,7 @@ split 往返一致、**错序必须被检出**、危险操作拦截、CLI 参数
 pdf-interleave_tool_diy/
 ├── SKILL.md                   # 本文件（技能定义）
 ├── README.md                  # 面向使用者的说明
+├── LICENSE                    # MIT
 ├── requirements.txt           # pymupdf / numpy / pillow
 └── scripts/
     ├── interleave_pdf.py      # 主脚本（merge / split / verify / info）
