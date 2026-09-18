@@ -8,9 +8,12 @@ selftest.py — pdf-interleave_tool_diy 自检脚本（不依赖任何真实数�
   2. 页数不等（不丢页）与 --pad blank（补空白页）
   3. --first even 交换起始侧
   4. --drop-odd / --drop-even 修正偏移
-  5. split 拆分后回拼校验（往返一致性）
-  6. **反向测试**：人为打乱页序，verify 必须报 FAILED（防止校验器空转）
-  7. 危险操作拦截：输出路径等于输入、两个输入同一文件
+  5. **--reverse-even / --reverse-odd 处理整侧倒序**，并断言
+     「不倒序时 verify 仍报 ALL MATCH」这一校验盲区确实存在（回归保护）
+  6. split 拆分后回拼校验（往返一致性）
+  7. **反向测试**：人为打乱页序，verify 必须报 FAILED（防止校验器空转）
+  8. 危险操作拦截：输出路径等于输入、两个输入同一文件
+  9. footer_pageno.py 页脚对照图（有 numpy+Pillow 时才跑，否则 SKIP）
 
 用法：
     python scripts/selftest.py            # 全部用例
@@ -32,6 +35,7 @@ except Exception:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL = os.path.join(HERE, "interleave_pdf.py")
+FOOTER = os.path.join(HERE, "footer_pageno.py")
 
 PASSED, FAILED = [], []
 
@@ -61,6 +65,17 @@ def texts(fitz, path: str) -> list[str]:
     out = [doc[i].get_text().strip() for i in range(doc.page_count)]
     doc.close()
     return out
+
+
+def make_fixture_desc(fitz, path: str, tag: str, pages: int, size=(595, 842)):
+    """与 make_fixture 同内容，但页序整体倒过来（模拟翻面重扫得到的倒序侧）。"""
+    doc = fitz.open()
+    for i in range(pages):
+        p = doc.new_page(width=size[0], height=size[1])
+        p.insert_text((72, 120), f"{tag}-{pages - i:02d}", fontsize=44)
+    doc.save(path)
+    doc.close()
+    return path
 
 
 def main():
@@ -128,8 +143,51 @@ def main():
     check("输出 17 页", len(t) == 17, f"实际 {len(t)}")
     check("even 首页已被剔除", "EVEN-01" not in t, str(t[:4]))
 
-    # ---------- 5. split 往返 ----------
-    print("\n5. split 往返一致性")
+    # ---------- 5. 整侧倒序 ----------
+    print("\n5. 整侧倒序（翻面重扫最常见的坑）")
+    even_desc = make_fixture_desc(fitz, os.path.join(tmp, "even_desc.pdf"), "EVEN", 9)
+    check("倒序侧构造正确（首页应为 EVEN-09）",
+          texts(fitz, even_desc)[0] == "EVEN-09", str(texts(fitz, even_desc)[:3]))
+
+    # 5a. 不倒序直接合 —— 页面结构看起来对，verify 却照样 ALL MATCH（盲区）
+    m_naive = os.path.join(tmp, "naive_desc.pdf")
+    r = run(["merge", odd, even_desc, "-o", m_naive, "--verify"], py)
+    nv = texts(fitz, m_naive)
+    check("盲区确认：不倒序时 verify 仍报 ALL MATCH", "ALL MATCH" in r.stdout, r.stdout[:300])
+    check("盲区确认：但页序其实是错的（第 2 页 = EVEN-09）",
+          nv[1] == "EVEN-09", f"实际 {nv[:4]}")
+
+    # 5b. 加 --reverse-even 后应还原成正确页序
+    m_rev = os.path.join(tmp, "rev_even.pdf")
+    r = run(["merge", odd, even_desc, "-o", m_rev, "--reverse-even", "--verify"], py)
+    check("--reverse-even 命令成功返回", r.returncode == 0, r.stdout + r.stderr)
+    t = texts(fitz, m_rev)
+    check("输出 18 页", len(t) == 18, f"实际 {len(t)}")
+    check("页序恢复 = ODD1,EVEN1,ODD2,EVEN2,...", t == expect, f"实际 {t[:6]}...")
+    check("位图校验 ALL MATCH", "ALL MATCH" in r.stdout, r.stdout)
+    check("输出里标出倒序侧", "reversed: even" in r.stdout, r.stdout[:400])
+
+    # 5c. verify 子命令也要认得倒序侧
+    r = run(["verify", m_rev, "--odd", odd, "--even", even_desc, "--reverse-even"], py)
+    check("verify --reverse-even 通过", r.returncode == 0 and "ALL MATCH" in r.stdout, r.stdout[:300])
+    r = run(["verify", m_rev, "--odd", odd, "--even", even_desc], py)
+    check("verify 漏传 --reverse-even 时判 FAILED", r.returncode == 2, r.stdout[:300])
+
+    # 5d. --reverse-odd 与 --drop-* 叠加：先丢开头 N 页，再整体倒序
+    odd_desc = make_fixture_desc(fitz, os.path.join(tmp, "odd_desc.pdf"), "ODD", 9)
+    # 倒序后 [ODD-09..ODD-01]，丢掉（文件顺序的）首 1 页 = ODD-09，再倒序 => ODD-01..ODD-08（8 页）
+    # even 仍 9 页，故 8 对 + 末尾多出的 EVEN-09 = 17 页
+    m_ro = os.path.join(tmp, "rev_odd_drop.pdf")
+    r = run(["merge", odd_desc, even, "-o", m_ro,
+             "--reverse-odd", "--drop-odd", "1", "--verify"], py)
+    t = texts(fitz, m_ro)
+    check("--reverse-odd + --drop-odd 输出 17 页", len(t) == 17, f"实际 {len(t)}")
+    check("首两页为 ODD-01 / EVEN-01", t[:2] == ["ODD-01", "EVEN-01"], f"实际 {t[:2]}")
+    check("末页是 even 多出的 EVEN-09", t[-1] == "EVEN-09", f"实际 {t[-1]}")
+    check("被丢掉的 ODD-09 不在结果里", "ODD-09" not in t, str(t))
+
+    # ---------- 6. split 往返 ----------
+    print("\n6. split 往返一致性")
     outdir = os.path.join(tmp, "split")
     r = run(["split", merged, "-o", outdir, "--verify"], py)
     check("split 成功", r.returncode == 0, r.stdout + r.stderr)
@@ -140,8 +198,8 @@ def main():
     check("even 文件 9 页", fitz.open(se).page_count == 9)
     check("拆分内容与源一致", texts(fitz, so) == texts(fitz, odd) and texts(fitz, se) == texts(fitz, even))
 
-    # ---------- 6. 反向测试：校验器必须能报错 ----------
-    print("\n6. 反向测试：人为错序必须被 verify 判定失败")
+    # ---------- 7. 反向测试：校验器必须能报错 ----------
+    print("\n7. 反向测试：人为错序必须被 verify 判定失败")
     bad = os.path.join(tmp, "bad.pdf")
     run(["merge", even, odd, "-o", bad], py)          # 位置参数反着传 => 等效 --first even
     check("位置参数反传与 --first even 结果一致",
@@ -150,21 +208,43 @@ def main():
     check("错序被检出（verdict=FAILED）", "FAILED" in r.stdout, r.stdout)
     check("错序时退出码为 2", r.returncode == 2, f"exit={r.returncode}")
 
-    # ---------- 7. 危险操作拦截 ----------
-    print("\n7. 危险操作拦截")
+    # ---------- 8. 危险操作拦截 ----------
+    print("\n8. 危险操作拦截")
     r = run(["merge", odd, even, "-o", odd], py)
     check("拒绝覆盖输入文件", r.returncode != 0 and "覆盖" in r.stdout, r.stdout)
     r = run(["merge", odd, odd, "-o", os.path.join(tmp, "x.pdf")], py)
     check("拒绝两个输入相同", r.returncode != 0 and "同一个文件" in r.stdout, r.stdout)
 
-    # ---------- 8. CLI 形态与 JSON ----------
-    print("\n8. CLI：--json 前置/后置、info")
+    # ---------- 9. CLI 形态与 JSON ----------
+    print("\n9. CLI：--json 前置/后置、info")
     r1 = run(["merge", odd, even, "-o", os.path.join(tmp, "j1.pdf"), "--json"], py)
     r2 = run(["--json", "merge", odd, even, "-o", os.path.join(tmp, "j2.pdf")], py)
     check("--json 写在子命令之后可用", '"output_pages": 18' in r1.stdout, r1.stdout[:200])
     check("--json 写在子命令之前也可用", '"output_pages": 18' in r2.stdout, r2.stdout[:200])
     r = run(["info", odd, even, "--json"], py)
     check("info --json 正常", '"pages": 9' in r.stdout, r.stdout[:200])
+
+    # ---------- 10. footer_pageno：合并前的页脚判读 ----------
+    print("\n10. footer_pageno 页脚对照图（前置判读）")
+    try:
+        import numpy  # noqa: F401
+        import PIL  # noqa: F401
+        has_pil_np = True
+    except ImportError:
+        has_pil_np = False
+    if not has_pil_np:
+        print("  [SKIP] 当前解释器缺 numpy/Pillow，跳过（脚本自身会自动换解释器）")
+    else:
+        fdir = os.path.join(tmp, "footers")
+        r = subprocess.run([py or sys.executable, FOOTER, odd, even_desc,
+                            "--out", fdir, "--json"],
+                           capture_output=True, text=True, encoding="utf-8")
+        check("footer_pageno 成功返回", r.returncode == 0, r.stdout + r.stderr)
+        check("JSON 报了页数与目标目录",
+              '"pages": 9' in r.stdout and '"out_dir"' in r.stdout, r.stdout[:300])
+        pngs = [f for f in os.listdir(fdir) if f.endswith(".png")] if os.path.isdir(fdir) else []
+        # 两个输入文件 × 各 9 页、每 4 页一张 => 2 × 3 = 6 张
+        check("生成了对照图 PNG（2 文件 × 3 张 = 6 张）", len(pngs) == 6, str(sorted(pngs)))
 
     print("\n" + "=" * 62)
     print(f"合计 {len(PASSED) + len(FAILED)} 项：PASS {len(PASSED)} / FAIL {len(FAILED)}")
