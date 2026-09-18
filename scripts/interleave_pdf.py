@@ -13,6 +13,9 @@ pdf-interleave_tool_diy — 奇数页 / 偶数页 PDF 交叉合并、拆分与�
   * 等页数时一一配对；不等页数时默认把多出的尾页原样追加，**绝不丢页**
   * --pad blank 可在短的一侧补空白页，保证后续页面的奇偶配对不串位
   * --drop-odd / --drop-even 处理「双面打印翻面扫描缺页」造成的 ±N 偏移
+  * --reverse-odd / --reverse-even 处理「某一侧整体倒序」，典型成因是该侧是
+    **反面（背面）扫描** —— 一叠纸整摞翻面后，原来最底下那张变成最上面，
+    于是页码从最后一页往回走，扫出来必然是递减。先 --drop-* 再 reverse
   * 自动寻找装有 PyMuPDF 的解释器并在子进程中重跑（本机实测：managed 裸解释器无 fitz）
 """
 from __future__ import annotations
@@ -138,12 +141,22 @@ def save_pdf(fitz, out: "fitz.Document", out_path: str):
 # --------------------------------------------------------------------------- #
 # merge
 # --------------------------------------------------------------------------- #
+def _side_index(doc, drop: int, reverse: bool) -> list[int]:
+    """一侧的取页顺序：先按文件顺序丢掉开头 drop 页，再按需整体倒序。"""
+    idx = list(range(max(0, drop), doc.page_count))
+    if reverse:
+        idx.reverse()
+    return idx
+
+
 def cmd_merge(fitz, args) -> dict:
     odd = open_doc(fitz, args.odd)
     even = open_doc(fitz, args.even)
 
-    odd_idx = list(range(args.drop_odd, odd.page_count))
-    even_idx = list(range(args.drop_even, even.page_count))
+    rev_odd = getattr(args, "reverse_odd", False)
+    rev_even = getattr(args, "reverse_even", False)
+    odd_idx = _side_index(odd, args.drop_odd, rev_odd)
+    even_idx = _side_index(even, args.drop_even, rev_even)
     if not odd_idx and not even_idx:
         die("两侧页面都被 --drop-* 排空了，没有可合并的内容。")
 
@@ -188,6 +201,9 @@ def cmd_merge(fitz, args) -> dict:
         "first": args.first,
         "padded_blank_pages": len(pads),
     }
+    if rev_odd or rev_even:
+        result["reversed"] = ",".join(
+            [s for s, r in (("odd", rev_odd), ("even", rev_even)) if r])
 
     # 尾部对齐提示
     tail_note = None
@@ -203,6 +219,7 @@ def cmd_merge(fitz, args) -> dict:
         result["verify"] = do_verify(fitz, args.output, args.odd, args.even,
                                      first=args.first, drop_odd=args.drop_odd,
                                      drop_even=args.drop_even, pad=args.pad,
+                                     reverse_odd=rev_odd, reverse_even=rev_even,
                                      mapping=mapping, pads=pads)
     odd.close()
     even.close()
@@ -213,15 +230,16 @@ def cmd_merge(fitz, args) -> dict:
 # 校验
 # --------------------------------------------------------------------------- #
 def do_verify(fitz, merged_path, odd_path, even_path, first="odd",
-              drop_odd=0, drop_even=0, pad="none", mapping=None, pads=None) -> dict:
+              drop_odd=0, drop_even=0, pad="none", reverse_odd=False,
+              reverse_even=False, mapping=None, pads=None) -> dict:
     merged = open_doc(fitz, merged_path)
     odd = open_doc(fitz, odd_path)
     even = open_doc(fitz, even_path)
 
     if mapping is None:
         mapping, pads = [], []
-        odd_idx = list(range(drop_odd, odd.page_count))
-        even_idx = list(range(drop_even, even.page_count))
+        odd_idx = _side_index(odd, drop_odd, reverse_odd)
+        even_idx = _side_index(even, drop_even, reverse_even)
         n = max(len(odd_idx), len(even_idx))
         pos = 0
         for i in range(n):
@@ -378,6 +396,7 @@ def build_parser():
             "  python interleave_pdf.py merge odd.pdf even.pdf -o merged.pdf --verify\n"
             "  python interleave_pdf.py merge even.pdf odd.pdf -o merged.pdf --first even\n"
             "  python interleave_pdf.py merge odd.pdf even.pdf -o merged.pdf --drop-odd 1\n"
+            "  python interleave_pdf.py merge odd.pdf even.pdf -o merged.pdf --reverse-even\n"
             "  python interleave_pdf.py split merged.pdf -o ./out --verify\n"
             "  python interleave_pdf.py verify merged.pdf --odd odd.pdf --even even.pdf\n"
             "  python interleave_pdf.py info odd.pdf even.pdf\n"
@@ -386,8 +405,10 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     m = sub.add_parser("merge", parents=[common], help="交叉合并 odd/even 两个 PDF")
-    m.add_argument("odd", help="奇数页那一路文件（正常情况下含 1,3,5... 页）")
-    m.add_argument("even", help="偶数页那一路文件（正常情况下含 2,4,6... 页）")
+    m.add_argument("odd", help="奇数页那一路（正面扫描：含 1,3,5... 页）。"
+                               "若这一路是反面扫描（页码递减），加 --reverse-odd")
+    m.add_argument("even", help="偶数页那一路（含 2,4,6... 页）。"
+                                "若这一路是反面扫描（页码递减），加 --reverse-even")
     m.add_argument("-o", "--output", required=True, help="输出的新 PDF 路径")
     m.add_argument("--first", choices=["odd", "even"], default="odd",
                    help="合并件第 1 页取自哪一路（默认 odd）。"
@@ -396,6 +417,11 @@ def build_parser():
                    help="跳过 odd 文件开头 N 页，用于修正 ±N 页偏移")
     m.add_argument("--drop-even", type=int, default=0, metavar="N",
                    help="跳过 even 文件开头 N 页")
+    m.add_argument("--reverse-odd", action="store_true",
+                   help="odd 那一路整体倒序取页（该路是反面/背面扫描时用；先 --drop-* 再倒序）")
+    m.add_argument("--reverse-even", action="store_true",
+                   help="even 那一路整体倒序取页（该路是反面/背面扫描时用——"
+                        "一叠纸翻面后页序物理上必然倒置）")
     m.add_argument("--pad", choices=["none", "blank"], default="none",
                    help="页数不等时：none=尾页原样追加（默认，不丢页），blank=补空白页保配对")
     m.add_argument("--verify", action="store_true", help="合并后逐页位图比对校验页序")
@@ -415,6 +441,10 @@ def build_parser():
     v.add_argument("--first", choices=["odd", "even"], default="odd")
     v.add_argument("--drop-odd", type=int, default=0, metavar="N")
     v.add_argument("--drop-even", type=int, default=0, metavar="N")
+    v.add_argument("--reverse-odd", action="store_true",
+                   help="odd 那一路在合并时是整体倒序的")
+    v.add_argument("--reverse-even", action="store_true",
+                   help="even 那一路在合并时是整体倒序的")
     v.add_argument("--pad", choices=["none", "blank"], default="none")
 
     i = sub.add_parser("info", parents=[common], help="查看页数 / 页面尺寸 / 文件大小")
@@ -445,7 +475,9 @@ def main():
 
     elif args.cmd == "verify":
         res = do_verify(fitz, args.merged, args.odd, args.even, first=args.first,
-                        drop_odd=args.drop_odd, drop_even=args.drop_even, pad=args.pad)
+                        drop_odd=args.drop_odd, drop_even=args.drop_even, pad=args.pad,
+                        reverse_odd=getattr(args, "reverse_odd", False),
+                        reverse_even=getattr(args, "reverse_even", False))
 
     else:
         res = cmd_info(fitz, args)
